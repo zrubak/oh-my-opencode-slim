@@ -5,7 +5,10 @@ import {
   DEFAULT_READ_CONTEXT_MIN_LINES,
   formatSystemReminder,
 } from '../config/constants';
-import type { BackgroundJobCAS, BackgroundJobStore } from './background-job-store';
+import type {
+  BackgroundJobCAS,
+  BackgroundJobStore,
+} from './background-job-store';
 import {
   clearBackgroundJobSuppression,
   getBackgroundJobLifecycleLedger,
@@ -165,9 +168,25 @@ export class BackgroundJobLaunchConflictError extends Error {
 }
 
 export type BackgroundJobDeletionOutcome =
-  | { kind: 'confirmed'; taskID: string; generation: number; lifecycleEpoch: number }
-  | { kind: 'synthetic-uncertain'; taskID: string; generation: number; lifecycleEpoch: number }
-  | { kind: 'ambiguous'; taskID: string; generation?: number; lifecycleEpoch?: number; reason: string };
+  | {
+      kind: 'confirmed';
+      taskID: string;
+      generation: number;
+      lifecycleEpoch: number;
+    }
+  | {
+      kind: 'synthetic-uncertain';
+      taskID: string;
+      generation: number;
+      lifecycleEpoch: number;
+    }
+  | {
+      kind: 'ambiguous';
+      taskID: string;
+      generation?: number;
+      lifecycleEpoch?: number;
+      reason: string;
+    };
 
 function sameCAS(a: BackgroundJobCAS, b: BackgroundJobCAS): boolean {
   return (
@@ -390,11 +409,13 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     if (
       input.expectedLifecycleEpoch !== undefined &&
       existing.lifecycleEpoch !== input.expectedLifecycleEpoch
-    ) return existing;
+    )
+      return existing;
     if (
       input.expectedParentSessionID !== undefined &&
       existing.parentSessionID !== input.expectedParentSessionID
-    ) return existing;
+    )
+      return existing;
     if (input.expected && !sameCAS(existing, input.expected)) return existing;
 
     // A wall-clock deadline is a hard, non-recoverable claim. Completion after
@@ -940,7 +961,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       (input.expectedParentSessionID !== undefined &&
         existing.parentSessionID !== input.expectedParentSessionID) ||
       (input.expected && !sameCAS(existing, input.expected))
-    ) return undefined;
+    )
+      return undefined;
 
     const now = input.now ?? Date.now();
     const updated: BackgroundJobRecord = {
@@ -976,7 +998,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       (input.expectedParentSessionID !== undefined &&
         existing.parentSessionID !== input.expectedParentSessionID) ||
       (input.expected && !sameCAS(existing, input.expected))
-    ) return existing;
+    )
+      return existing;
 
     const now = input.now ?? Date.now();
     const updated: BackgroundJobRecord = {

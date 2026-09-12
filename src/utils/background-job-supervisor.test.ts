@@ -179,6 +179,32 @@ describe('BackgroundJobSupervisor', () => {
     expect(abort).toHaveBeenCalledTimes(1);
   });
 
+  test('stale deadline callback cannot claim a relaunch epoch', async () => {
+    const { board, supervisor, abort } = createSupervisor();
+    const first = launch(board, true);
+    supervisor.onLaunch(first);
+    const lease = board.acquireRelaunchLease(first.taskID, first.generation);
+    expect(lease).toBeDefined();
+    if (!lease) throw new Error('relaunch lease was not acquired');
+    const second = board.registerLaunch({
+      taskID: first.taskID,
+      parentSessionID: first.parentSessionID,
+      agent: first.agent,
+      relaunchLease: lease,
+    });
+    supervisor.onLaunch(second);
+
+    (supervisor as any).onDeadline(
+      first.taskID,
+      first.generation,
+      first.lifecycleEpoch,
+    );
+
+    expect(abort).not.toHaveBeenCalled();
+    expect(board.get(first.taskID)?.generation).toBe(second.generation);
+    expect(board.get(first.taskID)?.lifecycleEpoch).toBe(second.lifecycleEpoch);
+  });
+
   test('busy activity after the deadline neither recovers nor renews the run', async () => {
     const { board, coordinator, supervisor, timers, abort } =
       createSupervisor();

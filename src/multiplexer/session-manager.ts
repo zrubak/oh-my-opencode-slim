@@ -8,10 +8,6 @@ import {
   type SessionReadinessOptions,
   waitForSessionReady,
 } from '../multiplexer';
-import {
-  createPaneTeardownHandle,
-  type PaneTeardownHandle,
-} from './types';
 import type { BackgroundJobState } from '../utils/background-job-board';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { log } from '../utils/logger';
@@ -20,6 +16,7 @@ import {
   type CmuxSessionLifecycleOptions,
 } from './cmux/session-lifecycle';
 import { CmuxSessionStore } from './cmux/session-state';
+import { createPaneTeardownHandle, type PaneTeardownHandle } from './types';
 
 type BackgroundJobReader = Pick<
   BackgroundJobStore,
@@ -184,6 +181,7 @@ export class MultiplexerSessionManager {
   private spawningSessions: SharedSessionState['spawningSessions'];
   private closingSessions: SharedSessionState['closingSessions'];
   private permanentlyClosedSessions: SharedSessionState['permanentlyClosedSessions'];
+  private epochs: SharedSessionState['epochs'];
   private permanentCloseUntil: SharedSessionState['permanentCloseUntil'];
   private pollInterval?: ReturnType<typeof setInterval>;
   private enabled = false;
@@ -216,6 +214,7 @@ export class MultiplexerSessionManager {
     this.spawningSessions = sharedState.spawningSessions;
     this.closingSessions = sharedState.closingSessions;
     this.permanentlyClosedSessions = sharedState.permanentlyClosedSessions;
+    this.epochs = sharedState.epochs;
     this.permanentCloseUntil = sharedState.permanentCloseUntil;
     this.readiness = options;
     this.now = options.now ?? Date.now;
@@ -279,6 +278,43 @@ export class MultiplexerSessionManager {
     this.readinessAbort = undefined;
   }
 
+  private nextSessionEpoch(sessionId: string): number {
+    const epoch = (this.epochs.get(sessionId) ?? 0) + 1;
+    this.epochs.set(sessionId, epoch);
+    return epoch;
+  }
+
+  private isPermanentlyClosed(sessionId: string): boolean {
+    if (!this.permanentlyClosedSessions.has(sessionId)) return false;
+    const expiresAt = this.permanentCloseUntil.get(sessionId);
+    if (expiresAt !== undefined && expiresAt <= this.now()) {
+      this.permanentlyClosedSessions.delete(sessionId);
+      this.permanentCloseUntil.delete(sessionId);
+      return false;
+    }
+    return true;
+  }
+
+  private createTrackedSession(
+    sessionId: string,
+    paneId: string,
+    parentId: string,
+    title: string,
+    directory: string,
+    adapter: Multiplexer,
+  ): TrackedSession {
+    return {
+      sessionId,
+      paneId,
+      parentId,
+      title,
+      directory,
+      ownerInstanceId: this.instanceId,
+      teardown: createPaneTeardownHandle(adapter, paneId),
+      epoch: this.nextSessionEpoch(sessionId),
+    };
+  }
+
   async onSessionCreated(event: SessionEvent): Promise<void> {
     if (this.cmuxLifecycle) return this.cmuxLifecycle.onSessionCreated(event);
     if (!this.enabled || !this.multiplexer) return;
@@ -292,7 +328,7 @@ export class MultiplexerSessionManager {
     const title = info.title ?? 'Subagent';
     const directory = info.directory ?? this.directory;
 
-    if (this.permanentlyClosedSessions.has(sessionId)) {
+    if (this.isPermanentlyClosed(sessionId)) {
       log('[multiplexer-session-manager] ignoring permanently closed session', {
         instanceId: this.instanceId,
         sessionId,
@@ -311,7 +347,7 @@ export class MultiplexerSessionManager {
     const closing = this.closingSessions.get(sessionId);
     if (closing) await closing;
 
-    if (this.permanentlyClosedSessions.has(sessionId)) return;
+    if (this.isPermanentlyClosed(sessionId)) return;
     if (this.isTrackedOrSpawning(sessionId)) return;
 
     this.knownSessions.set(sessionId, {
@@ -356,7 +392,7 @@ export class MultiplexerSessionManager {
       }
 
       if (
-        this.permanentlyClosedSessions.has(sessionId) ||
+        this.isPermanentlyClosed(sessionId) ||
         this.closingSessions.has(sessionId) ||
         this.sessions.has(sessionId)
       )
@@ -385,7 +421,7 @@ export class MultiplexerSessionManager {
       if (
         !this.knownSessions.has(sessionId) ||
         this.closingSessions.has(sessionId) ||
-        this.permanentlyClosedSessions.has(sessionId)
+        this.isPermanentlyClosed(sessionId)
       ) {
         await this.trackAndCloseStalePane(
           sessionId,
@@ -397,16 +433,17 @@ export class MultiplexerSessionManager {
         return;
       }
 
-      this.sessions.set(sessionId, {
+      this.sessions.set(
         sessionId,
-        paneId: paneResult.paneId,
-        parentId,
-        title,
-        directory,
-        ownerInstanceId: this.instanceId,
-        teardown: createPaneTeardownHandle(this.multiplexer, paneResult.paneId),
-        epoch: 0,
-      });
+        this.createTrackedSession(
+          sessionId,
+          paneResult.paneId,
+          parentId,
+          title,
+          directory,
+          this.multiplexer,
+        ),
+      );
 
       log('[multiplexer-session-manager] pane spawned', {
         instanceId: this.instanceId,
@@ -649,16 +686,17 @@ export class MultiplexerSessionManager {
   ): Promise<void> {
     const trackingId = `${sessionId}\0stale\0${paneId}`;
     if (!this.multiplexer) return;
-    this.sessions.set(trackingId, {
-      sessionId: trackingId,
-      paneId,
-      parentId,
-      title,
-      directory,
-      ownerInstanceId: this.instanceId,
-      teardown: createPaneTeardownHandle(this.multiplexer, paneId),
-      epoch: 0,
-    });
+    this.sessions.set(
+      trackingId,
+      this.createTrackedSession(
+        trackingId,
+        paneId,
+        parentId,
+        title,
+        directory,
+        this.multiplexer,
+      ),
+    );
     log('[multiplexer-session-manager] tracking stale spawned pane', {
       instanceId: this.instanceId,
       sessionId,
@@ -679,7 +717,7 @@ export class MultiplexerSessionManager {
     }
 
     const tracked = this.sessions.get(sessionId);
-    if (!tracked || !this.multiplexer) {
+    if (!tracked) {
       log('[multiplexer-session-manager] close skipped; session not tracked', {
         instanceId: this.instanceId,
         sessionId,
@@ -760,9 +798,7 @@ export class MultiplexerSessionManager {
     const closePromise = this.performClose(
       sessionId,
       tracked,
-      paneId,
       closeState,
-      this.multiplexer,
     ).finally(() => {
       if (this.closingSessions.get(sessionId) !== closePromise) return;
       this.closingSessions.delete(sessionId);
@@ -775,16 +811,20 @@ export class MultiplexerSessionManager {
   private async performClose(
     sessionId: string,
     tracked: TrackedSession,
-    paneId: string,
     closeState: PaneCloseState,
-    multiplexer: Multiplexer,
   ): Promise<void> {
     let closed = false;
     let error: string | undefined;
+    const teardown =
+      tracked.teardown ??
+      (this.multiplexer
+        ? createPaneTeardownHandle(this.multiplexer, tracked.paneId)
+        : undefined);
+    if (!teardown) return;
     try {
       // Await the adapter operation. A later retry cannot reuse this pane ID
       // until this promise has settled.
-      closed = await multiplexer.closePane(paneId);
+      closed = await teardown.adapter.closePane(teardown.paneId);
     } catch (err) {
       error = String(err);
     }
@@ -794,13 +834,19 @@ export class MultiplexerSessionManager {
     if (
       !current ||
       current !== tracked ||
-      current.paneId !== paneId ||
+      current.paneId !== teardown.paneId ||
+      (current.epoch !== undefined &&
+        tracked.epoch !== undefined &&
+        current.epoch !== tracked.epoch) ||
+      (current.teardown !== undefined &&
+        tracked.teardown !== undefined &&
+        current.teardown !== tracked.teardown) ||
       (current.ownerInstanceId !== this.instanceId && !deletionClose)
     ) {
       log('[multiplexer-session-manager] ignoring stale pane close result', {
         instanceId: this.instanceId,
         sessionId,
-        paneId,
+        paneId: teardown.paneId,
         closed,
         error,
       });
@@ -813,7 +859,7 @@ export class MultiplexerSessionManager {
       log('[multiplexer-session-manager] session pane close confirmed', {
         instanceId: this.instanceId,
         sessionId,
-        paneId,
+        paneId: teardown.paneId,
         attempt: closeState.attempts,
       });
       return;
@@ -832,7 +878,7 @@ export class MultiplexerSessionManager {
       {
         instanceId: this.instanceId,
         sessionId,
-        paneId,
+        paneId: teardown.paneId,
         reason: closeState.reason,
         attempt: closeState.attempts,
         phase: closeState.phase,
@@ -884,7 +930,7 @@ export class MultiplexerSessionManager {
 
   private async respawnIfKnown(sessionId: string): Promise<void> {
     if (!this.enabled || !this.multiplexer) return;
-    if (this.permanentlyClosedSessions.has(sessionId)) return;
+    if (this.isPermanentlyClosed(sessionId)) return;
 
     const trackedBeforeClose = this.sessions.get(sessionId);
     if (
@@ -903,7 +949,7 @@ export class MultiplexerSessionManager {
     const closing = this.closingSessions.get(sessionId);
     if (closing) await closing;
 
-    if (this.permanentlyClosedSessions.has(sessionId)) return;
+    if (this.isPermanentlyClosed(sessionId)) return;
     const tracked = this.sessions.get(sessionId);
     if (tracked) {
       if (tracked.closeState?.reason === 'idle') {
@@ -963,7 +1009,7 @@ export class MultiplexerSessionManager {
       }
 
       if (
-        this.permanentlyClosedSessions.has(sessionId) ||
+        this.isPermanentlyClosed(sessionId) ||
         this.sessions.has(sessionId) ||
         this.closingSessions.has(sessionId)
       )
@@ -992,7 +1038,7 @@ export class MultiplexerSessionManager {
       if (
         !this.knownSessions.has(sessionId) ||
         this.closingSessions.has(sessionId) ||
-        this.permanentlyClosedSessions.has(sessionId)
+        this.isPermanentlyClosed(sessionId)
       ) {
         await this.trackAndCloseStalePane(
           sessionId,
@@ -1004,16 +1050,17 @@ export class MultiplexerSessionManager {
         return;
       }
 
-      this.sessions.set(sessionId, {
+      this.sessions.set(
         sessionId,
-        paneId: paneResult.paneId,
-        parentId: known.parentId,
-        title: known.title,
-        directory: known.directory,
-        ownerInstanceId: this.instanceId,
-        teardown: createPaneTeardownHandle(this.multiplexer, paneResult.paneId),
-        epoch: 0,
-      });
+        this.createTrackedSession(
+          sessionId,
+          paneResult.paneId,
+          known.parentId,
+          known.title,
+          known.directory,
+          this.multiplexer,
+        ),
+      );
       this.backgroundJobBoard?.clearDeferredClose(sessionId);
 
       log('[multiplexer-session-manager] pane respawned on busy', {
@@ -1088,6 +1135,10 @@ export class MultiplexerSessionManager {
     }
     if (!this.enabled) return;
     this.permanentlyClosedSessions.add(sessionId);
+    this.permanentCloseUntil.set(
+      sessionId,
+      this.now() + this.permanentCloseTtlMs,
+    );
     await this.closeSession(sessionId, 'deleted', true);
   }
 
@@ -1095,6 +1146,7 @@ export class MultiplexerSessionManager {
     if (this.cmuxLifecycle) {
       await this.cmuxLifecycle.cleanup();
       this.permanentlyClosedSessions.clear();
+      this.permanentCloseUntil.clear();
       return;
     }
 
@@ -1116,6 +1168,7 @@ export class MultiplexerSessionManager {
       this.knownSessions.clear();
       this.spawningSessions.clear();
       this.permanentlyClosedSessions.clear();
+      this.permanentCloseUntil.clear();
       this.busyDuringSpawn.clear();
     } finally {
       this.cleanupInProgress = false;

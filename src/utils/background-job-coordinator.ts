@@ -9,7 +9,10 @@ import type {
   WallClockTimeoutClaimInput,
   WallClockTimeoutFinalizeInput,
 } from './background-job-board';
-import type { BackgroundJobCAS, BackgroundJobStore } from './background-job-store';
+import type {
+  BackgroundJobCAS,
+  BackgroundJobStore,
+} from './background-job-store';
 import { log } from './logger';
 
 type TerminalStateListener = (taskID: string) => void;

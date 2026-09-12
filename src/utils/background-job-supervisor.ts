@@ -15,6 +15,7 @@ export interface BackgroundJobSupervisorOptions {
 
 interface RunTimers {
   generation: number;
+  lifecycleEpoch: number;
   parentSessionID: string;
   deadlineTimer?: TimerHandle;
   graceTimer?: TimerHandle;
@@ -55,15 +56,25 @@ export class BackgroundJobSupervisor {
     }
 
     const current = this.runs.get(record.taskID);
-    if (current?.generation === record.generation) return;
+    if (
+      current?.generation === record.generation &&
+      current.lifecycleEpoch === record.lifecycleEpoch
+    )
+      return;
     this.clear(record.taskID);
 
     const run: RunTimers = {
       generation: record.generation,
+      lifecycleEpoch: record.lifecycleEpoch,
       parentSessionID: record.parentSessionID,
     };
     run.deadlineTimer = this.setTimer(
-      () => this.onDeadline(record.taskID, record.generation),
+      () =>
+        this.onDeadline(
+          record.taskID,
+          record.generation,
+          record.lifecycleEpoch,
+        ),
       Math.max(
         0,
         record.runStartedAt + this.options.wallClockTimeoutMs - this.now(),
@@ -81,7 +92,11 @@ export class BackgroundJobSupervisor {
       record.state === 'reconciled'
     ) {
       const run = this.runs.get(record.taskID);
-      if (run?.generation === record.generation) this.clear(record.taskID);
+      if (
+        run?.generation === record.generation &&
+        run.lifecycleEpoch === record.lifecycleEpoch
+      )
+        this.clear(record.taskID);
     }
   }
 
@@ -104,6 +119,13 @@ export class BackgroundJobSupervisor {
       this.options.backgroundJobStore.finalizeWallClockTimeout({
         taskID,
         generation: record.generation,
+        lifecycleEpoch: record.lifecycleEpoch,
+        expected: {
+          taskID,
+          generation: record.generation,
+          lifecycleEpoch: record.lifecycleEpoch,
+          parentSessionID: record.parentSessionID,
+        },
         now: this.now(),
         statusUncertain: false,
         resultSummary:
@@ -136,14 +158,31 @@ export class BackgroundJobSupervisor {
     this.runs.clear();
   }
 
-  private onDeadline(taskID: string, generation: number): void {
+  private onDeadline(
+    taskID: string,
+    generation: number,
+    lifecycleEpoch: number,
+  ): void {
     const run = this.runs.get(taskID);
-    if (this.disposed || !run || run.generation !== generation) return;
+    if (
+      this.disposed ||
+      !run ||
+      run.generation !== generation ||
+      run.lifecycleEpoch !== lifecycleEpoch
+    )
+      return;
     run.deadlineTimer = undefined;
 
     const claimed = this.options.backgroundJobStore.claimWallClockDeadline({
       taskID,
       generation,
+      lifecycleEpoch,
+      expected: {
+        taskID,
+        generation,
+        lifecycleEpoch,
+        parentSessionID: run.parentSessionID,
+      },
       now: this.now(),
     });
     if (!claimed) {
@@ -154,7 +193,7 @@ export class BackgroundJobSupervisor {
     // The grace timer is armed before abort is invoked. A rejected or hanging
     // SDK promise must never prevent the bounded terminal transition.
     run.graceTimer = this.setTimer(
-      () => this.onGraceExpired(taskID, generation),
+      () => this.onGraceExpired(taskID, generation, lifecycleEpoch),
       this.options.abortGraceMs,
     );
     Promise.resolve()
@@ -162,13 +201,30 @@ export class BackgroundJobSupervisor {
       .catch(() => undefined);
   }
 
-  private onGraceExpired(taskID: string, generation: number): void {
+  private onGraceExpired(
+    taskID: string,
+    generation: number,
+    lifecycleEpoch: number,
+  ): void {
     const run = this.runs.get(taskID);
-    if (this.disposed || !run || run.generation !== generation) return;
+    if (
+      this.disposed ||
+      !run ||
+      run.generation !== generation ||
+      run.lifecycleEpoch !== lifecycleEpoch
+    )
+      return;
     run.graceTimer = undefined;
     this.options.backgroundJobStore.finalizeWallClockTimeout({
       taskID,
       generation,
+      lifecycleEpoch,
+      expected: {
+        taskID,
+        generation,
+        lifecycleEpoch,
+        parentSessionID: run.parentSessionID,
+      },
       now: this.now(),
       statusUncertain: true,
       resultSummary:

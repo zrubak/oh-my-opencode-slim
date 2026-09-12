@@ -17,6 +17,10 @@ export {
 export type { SessionReadinessOptions } from './shared';
 export { waitForSessionReady } from './shared';
 export { TmuxMultiplexer } from './tmux';
-export type { Multiplexer, PaneResult } from './types';
-export { isServerRunning } from './types';
+export type {
+  Multiplexer,
+  PaneResult,
+  PaneTeardownHandle,
+} from './types';
+export { createPaneTeardownHandle, isServerRunning } from './types';
 export { ZellijMultiplexer } from './zellij';
