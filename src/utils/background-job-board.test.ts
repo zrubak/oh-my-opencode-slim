@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from './background-job-board';
+import {
+  getBackgroundJobDeletionEpoch,
+  isBackgroundJobTombstoned,
+} from './background-job-store';
 
 describe('BackgroundJobBoard', () => {
   test('registers background launches as running jobs with aliases', () => {
@@ -25,6 +29,59 @@ describe('BackgroundJobBoard', () => {
     expect(board.hasRunning('parent-1')).toBe(true);
     expect(board.hasRunningJobs()).toBe(true);
   });
+
+  test('rejects stale CAS updates after drop and same-ID relaunch', () => {
+    const board = new BackgroundJobBoard();
+    const first = board.registerLaunch({
+      taskID: 'ses_epoch',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+    });
+    const firstCAS = board.cas(first.taskID);
+    expect(firstCAS).toBeDefined();
+
+    board.drop(first.taskID);
+    expect(isBackgroundJobTombstoned(board, first.taskID)).toBe(true);
+    const deletionEpoch = getBackgroundJobDeletionEpoch(board, first.taskID);
+    const second = board.registerLaunch({
+      taskID: first.taskID,
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+    });
+
+    expect(second.lifecycleEpoch).toBeGreaterThan(deletionEpoch ?? 0);
+    expect(second.lifecycleEpoch).toBeGreaterThan(first.lifecycleEpoch);
+    expect(
+      board.updateStatus({
+        taskID: second.taskID,
+        state: 'completed',
+        expected: firstCAS,
+      })?.state,
+    ).toBe('running');
+    expect(board.cas(second.taskID)).not.toEqual(firstCAS);
+  });
+
+  test('leases carry lifecycle and parent identity and become invalid on drop', () => {
+    const board = new BackgroundJobBoard();
+    const job = board.registerLaunch({
+      taskID: 'ses_lease_epoch',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    const lease = board.acquireMessageLease(job.taskID, job.generation);
+
+    expect(lease).toMatchObject({
+      taskID: job.taskID,
+      generation: job.generation,
+      lifecycleEpoch: job.lifecycleEpoch,
+      parentSessionID: job.parentSessionID,
+    });
+    if (!lease) throw new Error('message lease was not acquired');
+    expect(board.validateLease(lease)).toBe(true);
+    board.drop(job.taskID);
+    expect(board.validateLease(lease)).toBe(false);
+  });
+
   test('hasRunningJobs is false once no job is running', () => {
     const board = new BackgroundJobBoard();
     expect(board.hasRunningJobs()).toBe(false);

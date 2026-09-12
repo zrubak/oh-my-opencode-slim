@@ -1069,6 +1069,90 @@ describe('MultiplexerSessionManager', () => {
       expect(mockMultiplexer.spawnPane).toHaveBeenCalledTimes(spawns);
     });
 
+    test('teardown uses the adapter captured when the pane was spawned', async () => {
+      const manager = new MultiplexerSessionManager(
+        createMockContext(),
+        defaultMultiplexerConfig,
+      );
+      await manager.onSessionCreated({
+        type: 'session.created',
+        properties: { info: { id: 'captured-adapter', parentID: 'parent-1' } },
+      });
+
+      const alternateClose = mock(async () => true);
+      (manager as any).multiplexer = {
+        ...mockMultiplexer,
+        closePane: alternateClose,
+      };
+      await manager.onSessionDeleted({
+        type: 'session.deleted',
+        properties: { sessionID: 'captured-adapter' },
+      });
+
+      expect(mockMultiplexer.closePane).toHaveBeenCalledWith('%mock-pane');
+      expect(alternateClose).not.toHaveBeenCalled();
+    });
+
+    test('advances the teardown epoch when a session respawns', async () => {
+      const manager = new MultiplexerSessionManager(
+        createMockContext(),
+        defaultMultiplexerConfig,
+      );
+      await manager.onSessionCreated({
+        type: 'session.created',
+        properties: { info: { id: 'epoch-session', parentID: 'parent-1' } },
+      });
+      const state = manager as any;
+      const firstEpoch = state.sessions.get('epoch-session').epoch;
+
+      await manager.onSessionStatus({
+        type: 'session.status',
+        properties: {
+          sessionID: 'epoch-session',
+          status: { type: 'idle' },
+        },
+      });
+      await manager.onSessionStatus({
+        type: 'session.status',
+        properties: {
+          sessionID: 'epoch-session',
+          status: { type: 'busy' },
+        },
+      });
+
+      expect(state.sessions.get('epoch-session').epoch).toBe(firstEpoch + 1);
+    });
+
+    test('expires permanent close protection after the safety TTL', async () => {
+      let now = 0;
+      const manager = new MultiplexerSessionManager(
+        createMockContext(),
+        defaultMultiplexerConfig,
+        undefined,
+        { now: () => now },
+      );
+      await manager.onSessionCreated({
+        type: 'session.created',
+        properties: {
+          info: { id: 'expiring-tombstone', parentID: 'parent-1' },
+        },
+      });
+      await manager.closeSessionPermanentlyFromCoordinator(
+        'expiring-tombstone',
+      );
+      expect(mockMultiplexer.spawnPane).toHaveBeenCalledTimes(1);
+
+      now = 5 * 60_000;
+      await manager.onSessionCreated({
+        type: 'session.created',
+        properties: {
+          info: { id: 'expiring-tombstone', parentID: 'parent-1' },
+        },
+      });
+
+      expect(mockMultiplexer.spawnPane).toHaveBeenCalledTimes(2);
+    });
+
     test('generic tombstone wins a duplicate created event awaiting an existing close', async () => {
       const close = createDeferred<boolean>();
       mockMultiplexer.closePane.mockImplementationOnce(() => close.promise);

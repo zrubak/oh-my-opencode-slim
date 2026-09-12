@@ -28,6 +28,14 @@ export interface BackgroundJobInjectedCompletionFence {
   lifecycleEpoch: number;
 }
 
+/** The complete identity required for a compare-and-swap mutation. */
+export interface BackgroundJobCAS {
+  readonly taskID: string;
+  readonly generation: number;
+  readonly lifecycleEpoch: number;
+  readonly parentSessionID: string;
+}
+
 /**
  * Process-local lifecycle memory shared by every hook using one job store.
  *
@@ -113,6 +121,20 @@ export function clearBackgroundJobSuppression(
   getBackgroundJobLifecycleLedger(store).tombstones.delete(taskID);
 }
 
+export function getBackgroundJobDeletionEpoch(
+  store: BackgroundJobStore,
+  taskID: string,
+): number | undefined {
+  return getBackgroundJobLifecycleLedger(store).deletionEpochs.get(taskID);
+}
+
+export function isBackgroundJobTombstoned(
+  store: BackgroundJobStore,
+  taskID: string,
+): boolean {
+  return getBackgroundJobLifecycleLedger(store).tombstones.has(taskID);
+}
+
 /**
  * Unified interface for background job operations.
  * Both BackgroundJobBoard and BackgroundJobCoordinator satisfy this.
@@ -188,6 +210,10 @@ export interface BackgroundJobStore {
       cancellationLease?: BackgroundJobLease;
     },
   ): BackgroundJobRecord | undefined;
+  /** Return the current store epoch; unlike wall-clock time this is monotonic. */
+  lifecycleEpoch(taskID?: string): number | undefined;
+  /** Return the authoritative CAS identity, or undefined for an unknown task. */
+  cas(taskID: string): BackgroundJobCAS | undefined;
   clearParent(parentSessionID: string): void;
   drop(taskID: string): void;
   addContext(taskID: string, files: ContextFile[]): void;

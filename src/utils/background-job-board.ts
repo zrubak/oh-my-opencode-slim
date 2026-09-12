@@ -5,9 +5,13 @@ import {
   DEFAULT_READ_CONTEXT_MIN_LINES,
   formatSystemReminder,
 } from '../config/constants';
-import type { BackgroundJobStore } from './background-job-store';
+import type {
+  BackgroundJobCAS,
+  BackgroundJobStore,
+} from './background-job-store';
 import {
   clearBackgroundJobSuppression,
+  getBackgroundJobLifecycleLedger,
   recordBackgroundJobSuppression,
 } from './background-job-store';
 import { log } from './logger';
@@ -39,6 +43,9 @@ export type BackgroundJobLeaseKind =
 export interface BackgroundJobLease {
   taskID: string;
   generation: number;
+  /** Epoch of the store record this handle was issued for. */
+  lifecycleEpoch: number;
+  parentSessionID?: string;
   token: string;
   kind: BackgroundJobLeaseKind;
 }
@@ -68,6 +75,8 @@ export interface BackgroundJobRecord {
   lastLaunchedAt: number;
   /** Monotonic run identity. Explicit relaunch/reuse increments it. */
   generation: number;
+  /** Store-authoritative lifecycle epoch. It changes on every new run and tombstone. */
+  lifecycleEpoch: number;
   /** Task-local run identity; unlike generation, unrelated tasks do not affect it. */
   taskGeneration: number;
   /** First launch observation for the current generation. */
@@ -118,6 +127,9 @@ export interface BackgroundJobStatusInput {
   state: TaskOutputState;
   /** Ignore native output from an older run of the same task ID. */
   expectedGeneration?: number;
+  expectedLifecycleEpoch?: number;
+  expectedParentSessionID?: string;
+  expected?: BackgroundJobCAS;
   timedOut?: boolean;
   statusUncertain?: boolean;
   resultSummary?: string;
@@ -128,6 +140,9 @@ export interface BackgroundJobStatusInput {
 export interface WallClockTimeoutClaimInput {
   taskID: string;
   generation: number;
+  lifecycleEpoch?: number;
+  expectedParentSessionID?: string;
+  expected?: BackgroundJobCAS;
   now?: number;
   resultSummary?: string;
 }
@@ -135,6 +150,9 @@ export interface WallClockTimeoutClaimInput {
 export interface WallClockTimeoutFinalizeInput {
   taskID: string;
   generation: number;
+  lifecycleEpoch?: number;
+  expectedParentSessionID?: string;
+  expected?: BackgroundJobCAS;
   now?: number;
   statusUncertain: boolean;
   resultSummary: string;
@@ -147,6 +165,36 @@ export class BackgroundJobLaunchConflictError extends Error {
     super(`Cannot register launch for ${taskID}: ${message}`);
     this.name = 'BackgroundJobLaunchConflictError';
   }
+}
+
+export type BackgroundJobDeletionOutcome =
+  | {
+      kind: 'confirmed';
+      taskID: string;
+      generation: number;
+      lifecycleEpoch: number;
+    }
+  | {
+      kind: 'synthetic-uncertain';
+      taskID: string;
+      generation: number;
+      lifecycleEpoch: number;
+    }
+  | {
+      kind: 'ambiguous';
+      taskID: string;
+      generation?: number;
+      lifecycleEpoch?: number;
+      reason: string;
+    };
+
+function sameCAS(a: BackgroundJobCAS, b: BackgroundJobCAS): boolean {
+  return (
+    a.taskID === b.taskID &&
+    a.generation === b.generation &&
+    a.lifecycleEpoch === b.lifecycleEpoch &&
+    a.parentSessionID === b.parentSessionID
+  );
 }
 
 const CANONICAL_TERMINAL_STATES = new Set<TaskOutputState>([
@@ -249,8 +297,16 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       }
     }
 
-    clearBackgroundJobSuppression(this, input.taskID);
-    const generation = ++this.executionSequence;
+    if (
+      existing &&
+      input.parentSessionID !== existing.parentSessionID &&
+      requestedLease?.parentSessionID !== existing.parentSessionID
+    ) {
+      throw new BackgroundJobLaunchConflictError(
+        input.taskID,
+        'the task is owned by another parent session',
+      );
+    }
 
     if (existing) {
       if (input.preserveRun) {
@@ -266,9 +322,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         return observed;
       }
 
+      clearBackgroundJobSuppression(this, input.taskID);
+      const generation = ++this.executionSequence;
+      const lifecycleEpoch = ++getBackgroundJobLifecycleLedger(this).nextEpoch;
+
       const updated = {
         ...existing,
         generation,
+        lifecycleEpoch,
         taskGeneration: existing.taskGeneration + 1,
         agent: input.agent || existing.agent,
         description: input.description || existing.description,
@@ -298,9 +359,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       return updated;
     }
 
+    clearBackgroundJobSuppression(this, input.taskID);
+    const generation = ++this.executionSequence;
+    const lifecycleEpoch = ++getBackgroundJobLifecycleLedger(this).nextEpoch;
+
     const record: BackgroundJobRecord = {
       taskID: input.taskID,
       generation,
+      lifecycleEpoch,
       taskGeneration: 1,
       parentSessionID: input.parentSessionID,
       agent: input.agent,
@@ -340,6 +406,17 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     ) {
       return existing;
     }
+    if (
+      input.expectedLifecycleEpoch !== undefined &&
+      existing.lifecycleEpoch !== input.expectedLifecycleEpoch
+    )
+      return existing;
+    if (
+      input.expectedParentSessionID !== undefined &&
+      existing.parentSessionID !== input.expectedParentSessionID
+    )
+      return existing;
+    if (input.expected && !sameCAS(existing, input.expected)) return existing;
 
     // A wall-clock deadline is a hard, non-recoverable claim. Completion after
     // that claim is late evidence and cannot replace the canonical timeout.
@@ -720,12 +797,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     ) {
       return undefined;
     }
-    const lease: BackgroundJobLease = {
+    const lease: BackgroundJobLease = Object.freeze({
       taskID,
       generation,
+      lifecycleEpoch: existing.lifecycleEpoch,
+      parentSessionID: existing.parentSessionID,
       token: this.nextLeaseToken('cancellation'),
       kind: 'cancellation',
-    };
+    });
     this.liveLeases.set(taskID, lease);
     return lease;
   }
@@ -738,12 +817,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     if (existing?.generation !== generation || this.liveLeases.has(taskID)) {
       return undefined;
     }
-    const lease: BackgroundJobLease = {
+    const lease: BackgroundJobLease = Object.freeze({
       taskID,
       generation,
+      lifecycleEpoch: existing.lifecycleEpoch,
+      parentSessionID: existing.parentSessionID,
       token: this.nextLeaseToken('relaunch'),
       kind: 'relaunch',
-    };
+    });
     this.liveLeases.set(taskID, lease);
     return lease;
   }
@@ -760,12 +841,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     ) {
       return undefined;
     }
-    const lease: BackgroundJobLease = {
+    const lease: BackgroundJobLease = Object.freeze({
       taskID,
       generation,
+      lifecycleEpoch: existing.lifecycleEpoch,
+      parentSessionID: existing.parentSessionID,
       token: this.nextLeaseToken('message'),
       kind: 'message',
-    };
+    });
     this.liveLeases.set(taskID, lease);
     return lease;
   }
@@ -788,12 +871,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     ) {
       return undefined;
     }
-    const lease: BackgroundJobLease = {
+    const lease: BackgroundJobLease = Object.freeze({
       taskID,
       generation,
+      lifecycleEpoch: existing.lifecycleEpoch,
+      parentSessionID: existing.parentSessionID,
       token: this.nextLeaseToken('terminal-notification'),
       kind: 'terminal-notification',
-    };
+    });
     this.liveLeases.set(taskID, lease);
     return lease;
   }
@@ -803,6 +888,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     return (
       activeLease?.token === lease.token &&
       activeLease.generation === lease.generation &&
+      activeLease.lifecycleEpoch === lease.lifecycleEpoch &&
       activeLease.kind === lease.kind
     );
   }
@@ -815,6 +901,22 @@ export class BackgroundJobBoard implements BackgroundJobStore {
 
   get(taskID: string): BackgroundJobRecord | undefined {
     return this.jobs.get(taskID);
+  }
+
+  lifecycleEpoch(taskID?: string): number | undefined {
+    if (taskID !== undefined) return this.jobs.get(taskID)?.lifecycleEpoch;
+    return getBackgroundJobLifecycleLedger(this).nextEpoch;
+  }
+
+  cas(taskID: string): BackgroundJobCAS | undefined {
+    const job = this.jobs.get(taskID);
+    if (!job) return undefined;
+    return Object.freeze({
+      taskID: job.taskID,
+      generation: job.generation,
+      lifecycleEpoch: job.lifecycleEpoch,
+      parentSessionID: job.parentSessionID,
+    });
   }
 
   field<K extends keyof BackgroundJobRecord>(
@@ -853,6 +955,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     ) {
       return undefined;
     }
+    if (
+      (input.lifecycleEpoch !== undefined &&
+        existing.lifecycleEpoch !== input.lifecycleEpoch) ||
+      (input.expectedParentSessionID !== undefined &&
+        existing.parentSessionID !== input.expectedParentSessionID) ||
+      (input.expected && !sameCAS(existing, input.expected))
+    )
+      return undefined;
 
     const now = input.now ?? Date.now();
     const updated: BackgroundJobRecord = {
@@ -882,6 +992,14 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     ) {
       return undefined;
     }
+    if (
+      (input.lifecycleEpoch !== undefined &&
+        existing.lifecycleEpoch !== input.lifecycleEpoch) ||
+      (input.expectedParentSessionID !== undefined &&
+        existing.parentSessionID !== input.expectedParentSessionID) ||
+      (input.expected && !sameCAS(existing, input.expected))
+    )
+      return existing;
 
     const now = input.now ?? Date.now();
     const updated: BackgroundJobRecord = {
@@ -1094,12 +1212,16 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   clearParent(parentSessionID: string): void {
     for (const job of this.list(parentSessionID)) {
       recordBackgroundJobSuppression(this, job.taskID);
+      this.liveLeases.delete(job.taskID);
       this.jobs.delete(job.taskID);
     }
   }
 
   drop(taskID: string): void {
     recordBackgroundJobSuppression(this, taskID);
+    // Teardown invalidates every outstanding safety handle. A stale handle must
+    // never be able to mutate a later run with the same native session ID.
+    this.liveLeases.delete(taskID);
     this.jobs.delete(taskID);
   }
 

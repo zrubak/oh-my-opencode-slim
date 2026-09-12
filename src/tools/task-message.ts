@@ -181,7 +181,7 @@ function assertMessageLease(
 ): void {
   if (lease.kind !== 'message' || !backgroundJobBoard.validateLease(lease)) {
     throw new Error(
-      `Task ${requested} message lease is no longer valid; refusing stale message`,
+      `Task ${requested} is no longer tracked or lease invalid; refusing stale message`,
     );
   }
 }
