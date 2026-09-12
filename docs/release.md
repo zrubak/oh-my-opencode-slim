@@ -201,7 +201,14 @@ bun run check:ci
 bun run typecheck
 bun test
 bun run build
+bun run verify:structure
+bun run verify:release
 ```
+
+`verify:structure` is the initial, import-free build check. It confirms that
+the source entrypoints, package exports, and required `dist/` files exist after
+the build. `verify:release` remains the final native Node ESM/tarball smoke gate
+and performs the clean-install runtime checks.
 
 CI installs the Bun version pinned by `packageManager` in `package.json` and
 uses `bun ci` so lockfile drift fails instead of rewriting `bun.lock`. Required

@@ -8,6 +8,10 @@ import {
   type SessionReadinessOptions,
   waitForSessionReady,
 } from '../multiplexer';
+import {
+  createPaneTeardownHandle,
+  type PaneTeardownHandle,
+} from './types';
 import type { BackgroundJobState } from '../utils/background-job-board';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { log } from '../utils/logger';
@@ -29,6 +33,8 @@ interface TrackedSession {
   title: string;
   directory: string;
   ownerInstanceId: string;
+  readonly teardown: PaneTeardownHandle;
+  readonly epoch: number;
   closeState?: PaneCloseState;
 }
 
@@ -52,6 +58,8 @@ interface SharedSessionState {
   spawningSessions: Set<string>;
   closingSessions: Map<string, Promise<void>>;
   permanentlyClosedSessions: Set<string>;
+  epochs: Map<string, number>;
+  permanentCloseUntil: Map<string, number>;
 }
 
 interface SessionEvent {
@@ -89,11 +97,15 @@ function getSharedState(): SharedSessionState {
       spawningSessions: new Set(),
       closingSessions: new Map(),
       permanentlyClosedSessions: new Set(),
+      epochs: new Map(),
+      permanentCloseUntil: new Map(),
     };
     globalWithState[SHARED_STATE_KEY] = state;
   }
   // Migrate state created by older plugin instances in this process.
   state.permanentlyClosedSessions ??= new Set();
+  state.epochs ??= new Map();
+  state.permanentCloseUntil ??= new Map();
   return state;
 }
 
@@ -104,6 +116,8 @@ export function resetMultiplexerSessionManagerState(): void {
   state.spawningSessions.clear();
   state.closingSessions.clear();
   state.permanentlyClosedSessions.clear();
+  state.epochs.clear();
+  state.permanentCloseUntil.clear();
   new CmuxSessionStore().resetForTests();
 }
 
@@ -170,6 +184,7 @@ export class MultiplexerSessionManager {
   private spawningSessions: SharedSessionState['spawningSessions'];
   private closingSessions: SharedSessionState['closingSessions'];
   private permanentlyClosedSessions: SharedSessionState['permanentlyClosedSessions'];
+  private permanentCloseUntil: SharedSessionState['permanentCloseUntil'];
   private pollInterval?: ReturnType<typeof setInterval>;
   private enabled = false;
   private cmuxLifecycle?: CmuxSessionLifecycle;
@@ -178,6 +193,7 @@ export class MultiplexerSessionManager {
   private readonly closeRetryMs: number;
   private readonly closeRetryMaxAttempts: number;
   private readonly shutdownTimeoutMs: number;
+  private readonly permanentCloseTtlMs = 5 * 60_000;
   private readinessAbort?: AbortController;
   private cleanupInProgress = false;
   /**
@@ -200,6 +216,7 @@ export class MultiplexerSessionManager {
     this.spawningSessions = sharedState.spawningSessions;
     this.closingSessions = sharedState.closingSessions;
     this.permanentlyClosedSessions = sharedState.permanentlyClosedSessions;
+    this.permanentCloseUntil = sharedState.permanentCloseUntil;
     this.readiness = options;
     this.now = options.now ?? Date.now;
     this.closeRetryMs = Number.isFinite(options.closeRetryMs)
@@ -387,6 +404,8 @@ export class MultiplexerSessionManager {
         title,
         directory,
         ownerInstanceId: this.instanceId,
+        teardown: createPaneTeardownHandle(this.multiplexer, paneResult.paneId),
+        epoch: 0,
       });
 
       log('[multiplexer-session-manager] pane spawned', {
@@ -629,6 +648,7 @@ export class MultiplexerSessionManager {
     directory: string,
   ): Promise<void> {
     const trackingId = `${sessionId}\0stale\0${paneId}`;
+    if (!this.multiplexer) return;
     this.sessions.set(trackingId, {
       sessionId: trackingId,
       paneId,
@@ -636,6 +656,8 @@ export class MultiplexerSessionManager {
       title,
       directory,
       ownerInstanceId: this.instanceId,
+      teardown: createPaneTeardownHandle(this.multiplexer, paneId),
+      epoch: 0,
     });
     log('[multiplexer-session-manager] tracking stale spawned pane', {
       instanceId: this.instanceId,
@@ -989,6 +1011,8 @@ export class MultiplexerSessionManager {
         title: known.title,
         directory: known.directory,
         ownerInstanceId: this.instanceId,
+        teardown: createPaneTeardownHandle(this.multiplexer, paneResult.paneId),
+        epoch: 0,
       });
       this.backgroundJobBoard?.clearDeferredClose(sessionId);
 

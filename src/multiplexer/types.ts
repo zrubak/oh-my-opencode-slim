@@ -67,6 +67,20 @@ export interface Multiplexer {
   applyLayout(layout: MultiplexerLayout, mainPaneSize: number): Promise<void>;
 }
 
+/** Immutable identity used for every pane teardown. */
+export interface PaneTeardownHandle {
+  readonly paneId: string;
+  readonly adapterType: Multiplexer['type'];
+  readonly adapter: Multiplexer;
+}
+
+export function createPaneTeardownHandle(
+  adapter: Multiplexer,
+  paneId: string,
+): PaneTeardownHandle {
+  return Object.freeze({ paneId, adapterType: adapter.type, adapter });
+}
+
 /**
  * Server health check utility (shared across implementations)
  */

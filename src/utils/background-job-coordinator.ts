@@ -9,7 +9,7 @@ import type {
   WallClockTimeoutClaimInput,
   WallClockTimeoutFinalizeInput,
 } from './background-job-board';
-import type { BackgroundJobStore } from './background-job-store';
+import type { BackgroundJobCAS, BackgroundJobStore } from './background-job-store';
 import { log } from './logger';
 
 type TerminalStateListener = (taskID: string) => void;
@@ -271,6 +271,14 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   }
 
   // ── Query methods ────────────────────────────────────────────────
+
+  lifecycleEpoch(taskID?: string): number | undefined {
+    return this.board.lifecycleEpoch(taskID);
+  }
+
+  cas(taskID: string): BackgroundJobCAS | undefined {
+    return this.board.cas(taskID);
+  }
 
   get(taskID: string): BackgroundJobRecord | undefined {
     return this.board.get(taskID);
